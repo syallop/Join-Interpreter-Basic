@@ -1,13 +1,24 @@
 resolver: lts-8.9
 packages:
 - .
-- location: https://github.com/syallop/Join-Language/archive/master.zip
+- location:
+    git: https://github.com/syallop/Join-Language.git
+    commit: e58660a1b495c8e772c4c30ccd7d6472961bf249
   extra-dep: true
-- location: https://github.com/syallop/DSL-Compose/archive/master.zip
+
+- location:
+    git: https://github.com/syallop/DSL-Compose.git
+    commit: 8e49641f049c586e21c36c6982f51670082e1e3f
   extra-dep: true
-- location: https://github.com/syallop/NonZero/archive/master.zip
+
+- location:
+    git: https://github.com/syallop/NonZero.git
+    commit: 6e63680e48383cbe6624028b7216c4ebfe208a8b
   extra-dep: true
-- location: https://github.com/syallop/Network-NS/archive/master.zip
+
+- location:
+    git: https://github.com/syallop/Network-NS.git
+    commit: 6f07d7829553f35cd4c6d2b1c090fabaf7948939
   extra-dep: true
 extra-deps:
 flags: {}
