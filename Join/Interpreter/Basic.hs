@@ -28,6 +28,10 @@ module Join.Interpreter.Basic
 
     , IState(..)
     , mkIState
+
+    , CoreState(..)
+    , DistState(..)
+    , SharedState(..)
     ) where
 
 import Prelude hiding (lookup)
@@ -57,6 +61,44 @@ import qualified Data.Map                  as Map
 import           Data.Maybe                         (fromJust,fromMaybe)
 import           Data.Typeable
 import           Data.Unique                        (hashUnique,newUnique)
+
+-- | State used by the core language interpreter only.
+data CoreState = CoreState
+  { -- | Reference to spawned sub-processes.
+   _coreStateChildren         :: Children
+
+  -- | Map synchronous channel ids to the location waiting for a response.
+  ,_coreStateReplyCtx         :: ReplyCtx
+  }
+
+-- | State used by the distributed language interpreter only.
+data DistState = DistState
+  { -- | Map Names we've exported, to functions that accept remote
+    -- messages directed to them.
+   _distStateRegistrations :: MVar (Map.Map Name (Msg -> IO ()))
+
+  -- | Reference to the client responsible for sending and receiving messages
+  -- between us (the interpreter) and a nameserver.
+  ,_distStateNsClient      :: Maybe Client
+  }
+
+-- | State shared between both the core and distributed language interpreter.
+data SharedState p = SharedState
+  { -- | Map ChanId's to the code responsible for handling them.
+    _sharedStateChannelOwnersRef :: ChannelOwnersRef p
+  }
+
+
+-- | Interpreter state.
+-- Combines the separate states together for now with the intention that later
+-- we will be able to thread only what is needed to the individual interpreters.
+-- This should make code reuse easier.
+data IState p = IState
+  {_iStateCoreState   :: CoreState
+  ,_iStateDistState   :: DistState
+  ,_iStateSharedState :: SharedState p
+  }
+
 
 -- | Some 'Rule tss p StatusPattern' with any 'tss'.
 data SomeRule p = forall tss. SomeRule (Rule tss p StatusPattern)
@@ -103,38 +145,22 @@ forkChild children io = do
   putMVar children (m:cs)
   forkFinally io (\_ -> putMVar m ())
 
--- | Interpreter state.
-data IState p = IState
-  { -- | Reference to spawned sub-processes.
-    _children         :: Children
-
-  -- | Map ChanId's to the code responsible for handling them.
-  , _channelOwnersRef :: ChannelOwnersRef p
-
-   -- | Map synchronous channel ids to the location waiting for a response.
-  , _replyCtx         :: ReplyCtx
-
-  -- | Map Names we've exported, to functions that accept remote
-  -- messages directed to them.
-  , _registrations    :: MVar (Map.Map Name (Msg -> IO ()))
-
-  -- | Reference to the client responsible for sending and receiving messages
-  -- between us (the interpreter) and a nameserver.
-  , _nsClient         :: Maybe Client
-  }
 
 -- | Create a new IState instance, (with no registered nameserver).
 mkIState :: IO (IState p)
 mkIState = IState
-  <$> newMVar []
-  <*> newMVar (ChannelOwners Map.empty)
-  <*> pure Map.empty
-  <*> newMVar Map.empty
-  <*> pure Nothing
+  <$> (CoreState <$> newMVar []
+                 <*> pure Map.empty
+      )
+  <*> (DistState <$> newMVar Map.empty
+                 <*> pure Nothing
+      )
+  <*> (SharedState <$> newMVar (ChannelOwners Map.empty)
+      )
 
 -- | Interpreter for the core language
 coreInterpreter :: InterpreterROn CoreInst p IO (IState p)
-coreInterpreter iState@(IState children channelOwnersRef replyCtx _ _) baseInt = \case
+coreInterpreter iState@(IState (CoreState children replyCtx ) _ (SharedState channelOwnersRef)) baseInt = \case
   Def definitions
     -> registerDefinition (toDefinitions definitions) channelOwnersRef
 
@@ -161,7 +187,7 @@ coreInterpreter iState@(IState children channelOwnersRef replyCtx _ _) baseInt =
 
 -- Interpreter for the distributed extension
 distInterpreter :: forall p. InterpreterROn DistInst p IO (IState p)
-distInterpreter iState@(IState children channelOwnersRef replyCtx _ _) baseInt = \case
+distInterpreter iState@(IState (CoreState children replyCtx) _ (SharedState channelOwnersRef)) baseInt = \case
   LookupChannel n
     -> lookupChannel' iState n
 
@@ -179,16 +205,16 @@ run p maddr = do
       Just (address,port)
         -> do iState <- mkIState
               nsClient <- runNewClient address port (msgHandler iState)
-              return $ iState{_nsClient = Just nsClient}
+              return $ iState{_iStateDistState = (_iStateDistState iState){_distStateNsClient = Just nsClient}}
 
     result <- interpretUsing (coreInterpreter & distInterpreter) iState p
 
-    waitForChildren (_children iState)
+    waitForChildren (_coreStateChildren . _iStateCoreState $ iState)
     return result
   where
     msgHandler :: IState p -> Callbacks
     msgHandler iState = Callbacks
-      {_callbackMsgFor = \name msg -> do registrations <- readMVar (_registrations iState)
+      {_callbackMsgFor = \name msg -> do registrations <- readMVar (_distStateRegistrations . _iStateDistState $ iState)
                                          case Map.lookup name registrations of
 
                                              -- Client promises we wont be sent messages to names
@@ -242,7 +268,7 @@ registerMessage :: MessageType a
                 -> (IState p -> p () -> IO b)
                 -> IO ()
 registerMessage chan msg iState retInt = do
-  ChannelOwners channelOwners <- readMVar (_channelOwnersRef iState)
+  ChannelOwners channelOwners <- readMVar (_sharedStateChannelOwnersRef . _iStateSharedState $ iState)
   let cId          = getId chan
       channelOwner = fromMaybe (error "registerMessage: chanId has no owner") $ Map.lookup cId channelOwners
   case channelOwner of
@@ -254,10 +280,12 @@ registerMessage chan msg iState retInt = do
 
             case mProcCtx of
                Nothing -> return ()
-               Just (p,replyCtx) -> void $ forkChild (_children iState) $ void $ retInt iState{_replyCtx=replyCtx} p
+               Just (p,replyCtx) -> void $ forkChild (_coreStateChildren . _iStateCoreState $ iState)
+                                           $ void
+                                            $ retInt iState{_iStateCoreState = (_iStateCoreState iState){_coreStateReplyCtx=replyCtx}} p
 
     OwnedByRemoteName name
-      -> void $ forkChild (_children iState) $ void $ msgTo (fromJust $ _nsClient iState) name (encodeMessage msg)
+      -> void $ forkChild (_coreStateChildren . _iStateCoreState $ iState) $ void $ msgTo (fromJust . _distStateNsClient . _iStateDistState $ iState) name (encodeMessage msg)
 
 -- | On a Synchronous Channel, register a message 'a' and return a 'Response r' on which a response can
 -- be waited.
@@ -268,8 +296,8 @@ registerSyncMessage :: (MessageType a, MessageType r)
                     -> (IState p -> p () -> IO b)
                     -> IO (Response r)
 registerSyncMessage chan msg iState retInt = do
-  let children         = _children iState
-      channelOwnersRef = _channelOwnersRef iState
+  let children         = _coreStateChildren . _iStateCoreState $ iState
+      channelOwnersRef = _sharedStateChannelOwnersRef . _iStateSharedState $ iState
 
   ChannelOwners channelOwners <- readMVar channelOwnersRef
   let cId          = getId chan
@@ -287,7 +315,9 @@ registerSyncMessage chan msg iState retInt = do
 
             case mProcCtx of
               Nothing -> return response
-              Just (p,replyCtx) -> do void $ forkChild (_children iState) $ void $ retInt iState{_replyCtx=replyCtx} p
+              Just (p,replyCtx) -> do void $ forkChild (_coreStateChildren . _iStateCoreState $ iState)
+                                            $ void
+                                             $ retInt iState{_iStateCoreState = (_iStateCoreState iState){_coreStateReplyCtx=replyCtx}} p
                                       return response
 
     OwnedByRemoteName name -> error "Synchronous remote names not implemented"
@@ -328,12 +358,12 @@ newId = hashUnique <$> newUnique
 -- Providing an incorrect type may cause exceptions on the recieving end.
 lookupChannel' :: forall p a. MessageType a => IState p -> Name -> IO (Maybe (Channel A a))
 lookupChannel' iState name = do
-  nameExists <- query (fromJust $ _nsClient iState) name
+  nameExists <- query (fromJust . _distStateNsClient . _iStateDistState $ iState) name
   if nameExists
     then do chan <- inferChannel <$> newChanId :: IO (Channel A a)
 
             -- Associate the remote name with the new channel
-            let channelOwnersRef = _channelOwnersRef iState
+            let channelOwnersRef = _sharedStateChannelOwnersRef . _iStateSharedState $ iState
             ChannelOwners channelOwners <- takeMVar channelOwnersRef
             let channelOwners' = Map.insert (getId chan) (OwnedByRemoteName name) channelOwners
 
@@ -350,12 +380,12 @@ registerChannel' :: forall p a. MessageType a
                  -> Channel A a
                  -> IO Bool
 registerChannel' iState baseInt name chan = do
-  nowRegistered <- register (fromJust $ _nsClient iState) name
+  nowRegistered <- register (fromJust . _distStateNsClient . _iStateDistState $ iState) name
   if nowRegistered
-    then do registrations <- takeMVar (_registrations iState)
+    then do registrations <- takeMVar (_distStateRegistrations . _iStateDistState $ iState)
             let rF = \msg -> registerMessage chan ((fromJust $ decodeMessage msg) :: a) iState baseInt
 
-            putMVar (_registrations iState) (Map.insert name rF registrations)
+            putMVar (_distStateRegistrations . _iStateDistState $ iState) (Map.insert name rF registrations)
             return True
     else return False
 
